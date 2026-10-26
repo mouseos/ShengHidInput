@@ -11,8 +11,11 @@ extern "C" void native_hid_input_observed(unsigned,int);
 extern "C" void native_hid_live_checkpoint(IOService *);
 extern "C" bool native_hid_input_requested(void);
 extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
-// Optional hardware buttons fed by the board button driver: a mask of report 2 bits, sent on every change.
+// Optional hardware buttons: report 2 mask, with this OSObject as callback context.
+// Board implementations retaining callbacks must retain the context and unregister on stop.
 extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __attribute__((weak_import));
+// Default absent/false: preserve the existing board ABI (only bits 1..3).
+extern "C" bool native_buttons_physical_home(void) __attribute__((weak_import));
 // Optional touch digitizer fed by the board touch probe (kits/sheng/TouchProbe.cpp): finger set published with a seqlock.
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
@@ -125,6 +128,7 @@ static void install(IORegistryEntry *driver) {
 class NativeHidInput : public IOHIDDevice {
     OSDeclareDefaultStructors(NativeHidInput)
     IOWorkLoop *inputLoop=nullptr;
+    bool physicalHome=false, buttonsActive=false, buttonsPending=false;
     IOTimerEventSource *timer=nullptr;
     bool down=false;
     uint8_t buttons=0;   // report 2 bits held by the hardware buttons
@@ -211,13 +215,23 @@ class NativeHidInput : public IOHIDDevice {
     }
     static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
-        self->buttons=static_cast<uint8_t>(uintptr_t(mask)&0xe);
+        if(!self->buttonsActive)return kIOReturnSuccess;
+        self->buttons=static_cast<uint8_t>(uintptr_t(mask)&(self->physicalHome?0xf:0xe));
+        self->buttonsPending=true;
         if(!self->hasEventDriverCached())return kIOReturnSuccess;
         unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(4,result);
+        // A failed release must remain pending even without another keypad
+        // edge. The timer retries the latest state on this same work loop.
+        if(result==kIOReturnSuccess)self->buttonsPending=false;
+        return kIOReturnSuccess;
+    }
+    static IOReturn buttonsStopAction(OSObject *owner,void *,void *,void *,void *) {
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);
+        if(self)self->buttonsActive=false;
         return kIOReturnSuccess;
     }
     bool hasEventDriverCached() {
@@ -252,6 +266,10 @@ class NativeHidInput : public IOHIDDevice {
             return;
         }
         native_hid_input_observed(3,1);
+        // A physical held state received before IOHIDEventDriver attached must
+        // not disappear merely because there is no subsequent keypad edge.
+        if(self->physicalHome && self->buttonsPending)
+            buttonsAction(self,reinterpret_cast<void *>(uintptr_t(self->buttons)),nullptr,nullptr,nullptr);
         if(!self->down && !native_hid_input_requested()) {source->setTimeoutMS(1000);return;}
         unsigned char report[]={2,static_cast<unsigned char>((self->down?0:1)|self->buttons)};
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
@@ -284,6 +302,8 @@ public:
     }
     bool start(IOService *provider) override {
         inputLoop=IOWorkLoop::workLoop();if(!inputLoop)return false;
+        physicalHome=&native_buttons_physical_home && native_buttons_physical_home();
+        buttonsActive=true;
         // Request the normal generic HID event personality for this owned
         // keyboard. This is a matching property, not a client entitlement.
         if(!setProperty("HIDDefaultBehavior",true))return false;
@@ -308,6 +328,8 @@ public:
         timer->setTimeoutMS(1000);return true;
     }
     void stop(IOService *provider) override {
+        // Serialize with queued button reports before dropping registration ownership.
+        if(inputLoop)inputLoop->runAction(&NativeHidInput::buttonsStopAction,this);
         if((touchOnly||touchEnabled) && &native_touch_set_sink)native_touch_set_sink(nullptr,nullptr);
         if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);
         if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
